@@ -1,20 +1,21 @@
-''' Demonstrates how to read an options chain '''
+''' 演示如何读取期权链 '''
 
 from datetime import datetime
-from threading import Thread
+from threading import Thread, Event
 import time
+from queue import Queue
 
 from ibapi.client import EClient, Contract
 from ibapi.wrapper import EWrapper
 from ibapi.utils import iswrapper
 
 class ChainReader(EWrapper, EClient):
-    ''' Serves as the client and the wrapper '''
+    ''' 作为客户端和包装器 '''
 
     def __init__(self, addr, port, client_id):
-        EClient. __init__(self, self)
+        EClient.__init__(self, self)
 
-        # Initialize variables
+        # 初始化变量
         self.conid = 0
         self.current_price = 0.0
         self.expiration = ''
@@ -24,37 +25,44 @@ class ChainReader(EWrapper, EClient):
         self.atm_index = -1
         self.chain = {}
 
-        # Connect to TWS
+        # 线程相关
+        self.data_ready = Event()
+        self.data_queue = Queue()
+
+        # 连接到TWS
         self.connect(addr, port, client_id)
 
-        # Launch the client thread
+        # 启动客户端线程
         thread = Thread(target=self.run)
         thread.start()
 
     @iswrapper
     def contractDetails(self, reqId, desc):
-        ''' Obtain contract ID '''
+        ''' 获取合约ID '''
         self.conid = desc.contract.conId
+        self.data_ready.set()
 
     @iswrapper
     def tickByTickMidPoint(self, reqId, time, midpoint):
-        ''' Obtain current price '''
+        ''' 获取当前价格 '''
         self.current_price = midpoint
+        self.data_ready.set()
 
     @iswrapper
     def securityDefinitionOptionParameter(self, reqId, exchange, underlyingConId, tradingClass, multiplier, expirations, strikes):
-        ''' Provide strike prices and expiration dates '''
+        ''' 提供行权价和到期日 '''
 
-        # Save expiration dates and strike prices
+        # 保存到期日和行权价
         self.exchange = exchange
         self.expirations = expirations
         self.strikes = strikes
+        #self.data_ready.set()
 
     @iswrapper
     def securityDefinitionOptionParameterEnd(self, reqId):
-        ''' Process data after receiving strikes/expirations '''
+        ''' 接收行权价/到期日后处理数据 '''
 
-        # Find strike price closest to current price
+        # 找到最接近当前价格的行权价
         self.strikes = sorted(self.strikes)
         min_dist = 99999.0
         for i, strike in enumerate(self.strikes):
@@ -63,7 +71,7 @@ class ChainReader(EWrapper, EClient):
                 self.atm_index = i
         self.atm_price = self.strikes[self.atm_index]
 
-        # Limit strike prices to +7/-7 around ATM
+        # 将行权价限制在平值期权周围的+7/-7范围内
         front = self.atm_index - 7
         back = len(self.strikes) - (self.atm_index + 7)
         if front > 0:
@@ -71,7 +79,7 @@ class ChainReader(EWrapper, EClient):
         if back > 0:
             del self.strikes[-(back-1):]
 
-        # Find an expiration date just over a month away
+        # 找到一个刚好超过一个月的到期日
         self.expirations = sorted(self.expirations)
         current_date = datetime.now()        
         for date in self.expirations:
@@ -79,114 +87,122 @@ class ChainReader(EWrapper, EClient):
             interval = exp_date - current_date
             if interval.days > 21:
                 self.expiration = date
-                print('Expiration: {}'.format(self.expiration))
+                print('到期日: {}'.format(self.expiration))
                 break
+        self.data_ready.set()
 
     @iswrapper
     def tickPrice(self, req_id, field, price, attribs):
-        ''' Provide option's ask price/bid price '''
+        ''' 提供期权的卖价/买价 '''
 
         if (field != 1 and field != 2) or price == -1.0:
             return        
         
-        # Determine the strike price and right
+        # 确定行权价和权利
         strike = self.strikes[(req_id - 3)//2]
         right = 'C' if req_id & 1 else 'P'
 
-        # Update the option chain
-        if field == 1:
-            self.chain[strike][right]['bid_price'] = price
-        elif field == 2:
-            self.chain[strike][right]['ask_price'] = price
+        # 更新期权链
+        self.data_queue.put(('price', strike, right, field, price))
 
     @iswrapper
     def tickSize(self, req_id, field, size):
-        ''' Provide option's ask size/bid size '''
+        ''' 提供期权的卖出量/买入量 '''
 
         if (field != 0 and field != 3) or size == 0:
             return
         
-        # Determine the strike price and right
+        # 确定行权价和权利
         strike = self.strikes[(req_id - 3)//2]
         right = 'C' if req_id & 1 else 'P'
 
-        # Update the option chain
-        if field == 0:
-            self.chain[strike][right]['bid_size'] = size
-        elif field == 3:
-            self.chain[strike][right]['ask_size'] = size
+        # 更新期权链
+        self.data_queue.put(('size', strike, right, field, size))
 
     def error(self, reqId, code, msg):
         if code != 200:
-            print('Error {}: {}'.format(code, msg))
+            print('错误 {}: {}'.format(code, msg))
 
 def read_option_chain(client, ticker):
 
-    # Define a contract for the underlying stock
+    # 定义标的股票的合约
     contract = Contract()
     contract.symbol = ticker
     contract.secType = 'STK'
     contract.exchange = 'SMART'
     contract.currency = 'USD'
     client.reqContractDetails(0, contract)
-    time.sleep(2)
+    client.data_ready.wait()
+    client.data_ready.clear()
 
-    # Get the current price of the stock
+    # 获取股票的当前价格
     client.reqTickByTickData(1, contract, "MidPoint", 1, True)
-    time.sleep(4)
+    client.data_ready.wait()
+    client.data_ready.clear()
 
-    # Request strike prices and expirations
+    # 请求行权价和到期日
     if client.conid:
         client.reqSecDefOptParams(2, ticker, '', 'STK', client.conid)
-        time.sleep(2)
+        client.data_ready.wait()
+        client.data_ready.clear()
     else:
-        print('Failed to obtain contract identifier.')
+        print('获取合约标识符失败。')
         exit()    
 
-    # Create contract for stock option
+    # 创建股票期权合约
     req_id = 3
     if client.strikes:
         for strike in client.strikes:        
             client.chain[strike] = {}
             for right in ['C', 'P']:
 
-                # Add to the option chain
+                # 添加到期权链
                 client.chain[strike][right] = {}
 
-                # Define the option contract
+                # 定义期权合约
                 contract.secType = 'OPT'
                 contract.right = right
                 contract.strike = strike
                 contract.exchange = client.exchange
                 contract.lastTradeDateOrContractMonth = client.expiration
 
-                # Request option data
+                # 请求期权数据
                 client.reqMktData(req_id, contract, '100', False, False, [])
                 req_id += 1
-                time.sleep(1)
     else:
-        print('Failed to access strike prices')
+        print('访问行权价失败')
         exit()
-    time.sleep(5)
 
-    # Remove empty elements
-    for strike in client.chain:
-        if client.chain[strike]['C'] == {} or client.chain[strike]['P'] == {}:
-            client.chain.pop(strike)
+    # 处理队列中的数据
+    while not client.data_queue.empty():
+        data_type, strike, right, field, value = client.data_queue.get()
+        if data_type == 'price':
+            if field == 1:
+                client.chain[strike][right]['bid_price'] = value
+            elif field == 2:
+                client.chain[strike][right]['ask_price'] = value
+        elif data_type == 'size':
+            if field == 0:
+                client.chain[strike][right]['bid_size'] = value
+            elif field == 3:
+                client.chain[strike][right]['ask_size'] = value
+
+    # 移除空元素
+    client.chain = {strike: data for strike, data in client.chain.items() if data['C'] and data['P']}
     return client.chain, client.atm_price
 
 def main():
 
-    # Create the client and connect to TWS
+    # 创建客户端并连接到TWS
     client = ChainReader('127.0.0.1', 7497, 0)
 
-    # Read the option chain
+    # 读取期权链
     chain, atm_price = read_option_chain(client, 'IBM')
     for strike in chain:
-        print('{} put: {}'.format(strike, chain[strike]['P']))
-        print('{} call: {}'.format(strike, chain[strike]['C']))
+        print('{} 看跌期权: {}'.format(strike, chain[strike]['P']))
+        print('{} 看涨期权: {}'.format(strike, chain[strike]['C']))
 
-    # Disconnect from TWS
+    # 断开与TWS的连接
     client.disconnect()
 
 if __name__ == '__main__':
